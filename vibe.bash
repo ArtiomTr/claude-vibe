@@ -95,15 +95,24 @@ SETTINGS
 "
     init_script+="chown claude:claude /home/claude/.claude/settings.json; "
 
-    init_script+='exec su claude -c "cd /workspace && claude --permission-mode acceptEdits $*" -- "$@"'
+    # Handle optional prompt via environment variable to avoid quoting issues
+    local prompt_env=""
+    local claude_cmd="claude --permission-mode acceptEdits"
+    if [[ -n "${CLAUDE_PROMPT:-}" ]]; then
+        prompt_env="-e CLAUDE_PROMPT"
+        init_script+='exec su claude -c "cd /workspace && claude --permission-mode acceptEdits -p \"\$CLAUDE_PROMPT\""'
+    else
+        init_script+='exec su claude -c "cd /workspace && claude --permission-mode acceptEdits"'
+    fi
 
     docker run --rm -it \
         "${mount_args[@]}" \
         -w /workspace \
         -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
+        ${CLAUDE_PROMPT:+-e CLAUDE_PROMPT="$CLAUDE_PROMPT"} \
         $extra_args \
         "$image_name" \
-        bash -c "$init_script" -- "$@"
+        bash -c "$init_script"
 }
 
 # Get the main branch name from remote
@@ -254,27 +263,44 @@ cmd_setup() {
         exit 1
     }
 
-    echo "Fetching from origin..."
-    git fetch origin
+    local is_bare
+    is_bare=$(git rev-parse --is-bare-repository 2>/dev/null)
 
-    local main_branch
-    main_branch=$(get_main_branch)
+    local setup_path="$repo_root"
+    local cleanup_worktree=""
 
-    if [[ -z "$main_branch" ]]; then
-        echo "Error: Could not determine main branch"
-        exit 1
+    if [[ "$is_bare" == "true" ]]; then
+        # For bare repos, create a temporary worktree for setup
+        echo "Bare repository detected, creating temporary worktree..."
+        local main_branch
+        main_branch=$(get_main_branch)
+        if [[ -z "$main_branch" ]]; then
+            main_branch="main"
+        fi
+        setup_path="$repo_root/../claude-setup-tmp"
+        git worktree add "$setup_path" "$main_branch" 2>/dev/null || git worktree add "$setup_path" "origin/$main_branch"
+        setup_path=$(cd "$setup_path" && pwd)
+        cleanup_worktree="$setup_path"
+    else
+        echo "Fetching from origin..."
+        git fetch origin
+
+        local main_branch
+        main_branch=$(get_main_branch)
+
+        if [[ -n "$main_branch" ]]; then
+            echo "Main branch: $main_branch"
+            echo "Checking out $main_branch..."
+            git checkout "$main_branch"
+            git pull origin "$main_branch"
+        fi
     fi
-
-    echo "Main branch: $main_branch"
-    echo "Checking out $main_branch..."
-    git checkout "$main_branch"
-    git pull origin "$main_branch"
 
     local image_name="claude-vibe-setup"
 
     echo "Building Docker image..."
-    if [[ -f "$repo_root/Dockerfile.vibes" ]]; then
-        docker build -t "$image_name" -f "$repo_root/Dockerfile.vibes" "$repo_root"
+    if [[ -f "$setup_path/Dockerfile.vibes" ]]; then
+        docker build -t "$image_name" -f "$setup_path/Dockerfile.vibes" "$setup_path"
     elif [[ -f "$SCRIPT_DIR/Dockerfile" ]]; then
         docker build -t "$image_name" -f "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR"
     else
@@ -283,8 +309,14 @@ cmd_setup() {
     fi
 
     echo "Starting Claude Code for project setup..."
-    run_container "$repo_root" "$image_name" "" \
-        --prompt "Analyze this project and create a Dockerfile.vibes file that includes all necessary dependencies and tools for development. The Dockerfile should be based on a minimal image but include everything needed to build and run this project. Please examine the project structure, dependencies, and build system to determine the requirements."
+    CLAUDE_PROMPT="Analyze this project and create a Dockerfile.vibes file that includes all necessary dependencies and tools for development. The Dockerfile should be based on sirsedev/claude-vibe as the base image (which already includes Claude Code). Add any project-specific dependencies needed to build and run this project. Please examine the project structure, dependencies, and build system to determine the requirements." \
+    run_container "$setup_path" "$image_name" ""
+
+    # Cleanup temporary worktree if created
+    if [[ -n "$cleanup_worktree" ]]; then
+        echo "Cleaning up temporary worktree..."
+        git worktree remove "$cleanup_worktree" --force 2>/dev/null || true
+    fi
 }
 
 # Command: help
