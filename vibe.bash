@@ -49,29 +49,26 @@ run_container() {
     local mount_args=()
     mount_args+=(-v "$worktree_path:/workspace")
 
-    # Mount Claude Code config as readonly to staging location (copy-on-write pattern)
+    # Container runs as 'claude' user, init script sets up config
     local init_script="set -e; "
 
-    # Create non-root user (--dangerously-skip-permissions refuses to run as root)
-    init_script+="useradd -m -s /bin/bash claude 2>/dev/null || true; "
-    init_script+="chown -R claude:claude /workspace; "
-
-    # Copy Claude config to user home first
+    # Copy Claude config to user home (use sudo to read host files, then fix ownership)
     if [[ -d "$HOME/.claude" ]]; then
         mount_args+=(-v "$HOME/.claude:/tmp/.claude-host:ro")
-        init_script+="cp -a /tmp/.claude-host /home/claude/.claude; "
-        init_script+="chown -R claude:claude /home/claude/.claude; "
+        init_script+="sudo cp -a /tmp/.claude-host ~/.claude && sudo chown -R \$(id -u):\$(id -g) ~/.claude; "
+        # Fix installation method mismatch (host may use native, container uses npm-global)
+        init_script+="sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"npm-global\"/g' ~/.claude/*.json 2>/dev/null || true; "
     fi
     if [[ -f "$HOME/.claude.json" ]]; then
         mount_args+=(-v "$HOME/.claude.json:/tmp/.claude-host.json:ro")
-        init_script+="cp /tmp/.claude-host.json /home/claude/.claude.json; "
-        init_script+="chown claude:claude /home/claude/.claude.json; "
+        init_script+="sudo cp /tmp/.claude-host.json ~/.claude.json && sudo chown \$(id -u):\$(id -g) ~/.claude.json; "
+        init_script+="sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"npm-global\"/g' ~/.claude.json 2>/dev/null || true; "
     fi
 
     # Setup Claude user settings with additionalDirectories to pre-trust /workspace
     # (overwrites any copied settings.json)
-    init_script+="mkdir -p /home/claude/.claude; "
-    init_script+="cat > /home/claude/.claude/settings.json << 'SETTINGS'
+    init_script+="mkdir -p ~/.claude; "
+    init_script+="cat > ~/.claude/settings.json << 'SETTINGS'
 {
   \"permissions\": {
     \"additionalDirectories\": [\"/workspace\"],
@@ -93,16 +90,12 @@ run_container() {
 }
 SETTINGS
 "
-    init_script+="chown claude:claude /home/claude/.claude/settings.json; "
 
     # Handle optional prompt via environment variable to avoid quoting issues
-    local prompt_env=""
-    local claude_cmd="claude --permission-mode acceptEdits"
     if [[ -n "${CLAUDE_PROMPT:-}" ]]; then
-        prompt_env="-e CLAUDE_PROMPT"
-        init_script+='exec su claude -c "cd /workspace && claude --permission-mode acceptEdits -p \"\$CLAUDE_PROMPT\""'
+        init_script+='exec claude --permission-mode acceptEdits -p "$CLAUDE_PROMPT"'
     else
-        init_script+='exec su claude -c "cd /workspace && claude --permission-mode acceptEdits"'
+        init_script+='exec claude --permission-mode acceptEdits'
     fi
 
     docker run --rm -it \
@@ -124,26 +117,28 @@ get_main_branch() {
 is_worktree_synced() {
     local worktree_path="$1"
 
-    cd "$worktree_path"
+    (
+        cd "$worktree_path" || exit 1
 
-    # Get current branch
-    local branch
-    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
+        # Get current branch
+        local branch
+        branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 1
 
-    # Check if branch exists on remote
-    if ! git ls-remote --exit-code --heads origin "$branch" &>/dev/null; then
-        return 1
-    fi
+        # Check if branch exists on remote
+        if ! git ls-remote --exit-code --heads origin "$branch" &>/dev/null; then
+            exit 1
+        fi
 
-    # Fetch latest
-    git fetch origin "$branch" &>/dev/null || return 1
+        # Fetch latest
+        git fetch origin "$branch" &>/dev/null || exit 1
 
-    # Compare local and remote
-    local local_commit remote_commit
-    local_commit=$(git rev-parse HEAD)
-    remote_commit=$(git rev-parse "origin/$branch" 2>/dev/null) || return 1
+        # Compare local and remote
+        local local_commit remote_commit
+        local_commit=$(git rev-parse HEAD)
+        remote_commit=$(git rev-parse "origin/$branch" 2>/dev/null) || exit 1
 
-    [[ "$local_commit" == "$remote_commit" ]]
+        [[ "$local_commit" == "$remote_commit" ]]
+    )
 }
 
 # Command: new
@@ -217,6 +212,41 @@ cmd_continue() {
     run_container "$worktree_path" "$image_name"
 }
 
+# Check if worktree has no commits and no changes (unused worktree)
+is_worktree_unused() {
+    local worktree_path="$1"
+
+    (
+        cd "$worktree_path" || exit 1
+
+        # Check if working tree is clean (no uncommitted changes)
+        if ! git diff --quiet HEAD 2>/dev/null; then
+            exit 1  # Has uncommitted changes
+        fi
+        if ! git diff --cached --quiet HEAD 2>/dev/null; then
+            exit 1  # Has staged changes
+        fi
+        # Check for untracked files (excluding .claude directory)
+        if [[ -n $(git ls-files --others --exclude-standard | grep -v '^\.claude/') ]]; then
+            exit 1  # Has untracked files
+        fi
+
+        # Get current branch
+        local branch
+        branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 1
+
+        # Find the merge base with main/master (where branch was created from)
+        local main_branch
+        main_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@') || main_branch="main"
+
+        # Check if there are any commits on this branch beyond the merge base
+        local commits_ahead
+        commits_ahead=$(git rev-list --count "origin/$main_branch..$branch" 2>/dev/null) || commits_ahead=$(git rev-list --count "$main_branch..$branch" 2>/dev/null) || exit 1
+
+        [[ "$commits_ahead" -eq 0 ]]
+    )
+}
+
 # Command: cleanup
 cmd_cleanup() {
     local repo_root
@@ -246,8 +276,15 @@ cmd_cleanup() {
             git worktree remove "$worktree_path" --force
             git branch -D "$branch" 2>/dev/null || true
             ((cleaned++))
+        elif is_worktree_unused "$worktree_path"; then
+            echo "  Unused (no commits, no changes), removing..."
+            local branch
+            branch=$(cd "$worktree_path" && git rev-parse --abbrev-ref HEAD)
+            git worktree remove "$worktree_path" --force
+            git branch -D "$branch" 2>/dev/null || true
+            ((cleaned++))
         else
-            echo "  Not synced, keeping"
+            echo "  Has local changes or commits, keeping"
         fi
     done < <(git worktree list | grep "${WORKTREE_PREFIX}")
 
