@@ -54,7 +54,9 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Clone { url, directory }) => commands::clone::run(&url, directory),
         Some(Commands::New) => commands::new::run(),
-        Some(Commands::Continue { worktree_name }) => commands::continue_session::run(worktree_name),
+        Some(Commands::Continue { worktree_name }) => {
+            commands::continue_session::run(worktree_name)
+        }
         Some(Commands::Cleanup) => commands::cleanup::run(),
         Some(Commands::Setup) => commands::setup::run(),
         None => {

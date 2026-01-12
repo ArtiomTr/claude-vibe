@@ -3,7 +3,7 @@
 use anyhow::Result;
 use rand::Rng;
 
-use crate::{docker, git, WORKTREE_PREFIX};
+use crate::{WORKTREE_PREFIX, docker, git};
 
 /// Generate a random alphanumeric string for worktree naming.
 fn generate_random_name(length: usize) -> String {

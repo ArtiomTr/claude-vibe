@@ -1,8 +1,8 @@
 //! Continue an existing Claude Code session.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
-use crate::{docker, git, WORKTREE_PREFIX};
+use crate::{WORKTREE_PREFIX, docker, git};
 
 /// Run the `continue` command: attach to an existing worktree session.
 pub fn run(worktree_name: Option<String>) -> Result<()> {

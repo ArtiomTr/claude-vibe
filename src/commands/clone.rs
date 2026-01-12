@@ -1,6 +1,6 @@
 //! Clone a repository as bare repo with worktree support.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -22,10 +22,7 @@ fn extract_repo_name(url: &str) -> Option<String> {
     // - /path/to/repo.git
     // - repo.git
     let url = url.trim_end_matches('/');
-    let name = url
-        .rsplit('/')
-        .next()
-        .or_else(|| url.rsplit(':').next())?;
+    let name = url.rsplit('/').next().or_else(|| url.rsplit(':').next())?;
 
     // Remove .git suffix if present
     let name = name.strip_suffix(".git").unwrap_or(name);
@@ -78,7 +75,11 @@ pub fn run(url: &str, directory: Option<String>) -> Result<()> {
     // Configure the bare repo to fetch all branches
     let status = Command::new("git")
         .current_dir(target_dir)
-        .args(["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"])
+        .args([
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ])
         .status()
         .context("Failed to configure remote fetch")?;
 

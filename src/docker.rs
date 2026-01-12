@@ -1,6 +1,6 @@
 //! Docker utility functions for building images and running containers.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use nix::unistd::{Gid, Uid};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
@@ -45,7 +45,10 @@ enum ClaudeEvent {
     #[serde(rename = "user")]
     User { message: UserMessage },
     #[serde(rename = "result")]
-    Result { result: String, cost_usd: Option<f64> },
+    Result {
+        result: String,
+        cost_usd: Option<f64>,
+    },
     /// System events - can have either a message string or a subtype (like "init")
     System {
         #[serde(default)]
@@ -72,8 +75,13 @@ struct UserMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(dead_code)]
 enum ContentBlock {
-    Text { text: String },
-    ToolUse { name: String, input: serde_json::Value },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        name: String,
+        input: serde_json::Value,
+    },
     /// Tool results can have content as string or array of objects
     ToolResult {
         tool_use_id: String,
@@ -173,9 +181,7 @@ impl StreamingDisplay {
 
         if self.finished {
             // Finished state: checkmark + collapsed view
-            println!(
-                "\x1b[32m✓ Claude analyzed your project\x1b[0m"
-            );
+            println!("\x1b[32m✓ Claude analyzed your project\x1b[0m");
             self.header_printed = true;
 
             // Show final result if available
@@ -350,7 +356,10 @@ fn summarize_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
 /// Source of Docker image to use.
 pub enum ImageSource {
     /// Build from a Dockerfile.vibes at the given path
-    BuildFrom { dockerfile: PathBuf, context: PathBuf },
+    BuildFrom {
+        dockerfile: PathBuf,
+        context: PathBuf,
+    },
     /// Use the default pre-built image
     UseDefault,
 }
@@ -391,7 +400,10 @@ pub fn find_image_source(worktree_path: &Path) -> Result<ImageSource> {
 /// Returns the image name to use for running the container.
 pub fn prepare_image(worktree_path: &Path, image_name: &str) -> Result<String> {
     match find_image_source(worktree_path)? {
-        ImageSource::BuildFrom { dockerfile, context } => {
+        ImageSource::BuildFrom {
+            dockerfile,
+            context,
+        } => {
             println!("Building from {}...", dockerfile.display());
             build_image_from(&dockerfile, &context, image_name)?;
             Ok(image_name.to_string())
@@ -405,11 +417,18 @@ pub fn prepare_image(worktree_path: &Path, image_name: &str) -> Result<String> {
 
 /// Build a Docker image from a specific Dockerfile.
 fn build_image_from(dockerfile: &Path, context: &Path, image_name: &str) -> Result<()> {
+    let (uid, gid) = get_host_uid_gid();
     let status = Command::new("docker")
         .args([
             "build",
-            "-t", image_name,
-            "-f", dockerfile.to_str().unwrap(),
+            "-t",
+            image_name,
+            "--build-arg",
+            &format!("USER_ID={}", uid),
+            "--build-arg",
+            &format!("GROUP_ID={}", gid),
+            "-f",
+            dockerfile.to_str().unwrap(),
             context.to_str().unwrap(),
         ])
         .status()
@@ -428,7 +447,6 @@ fn build_image_from(dockerfile: &Path, context: &Path, image_name: &str) -> Resu
 pub fn run_container(worktree_path: &Path, image_name: &str, prompt: Option<&str>) -> Result<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-    let (host_uid, host_gid) = get_host_uid_gid();
 
     let mut args = vec![
         "run".to_string(),
@@ -440,19 +458,10 @@ pub fn run_container(worktree_path: &Path, image_name: &str, prompt: Option<&str
         "/workspace".to_string(),
         "-e".to_string(),
         format!("ANTHROPIC_API_KEY={}", api_key),
-        "-e".to_string(),
-        format!("HOST_UID={}", host_uid),
-        "-e".to_string(),
-        format!("HOST_GID={}", host_gid),
     ];
 
     // Build init script for container startup
-    // First, update claude user UID/GID to match host user for proper file permissions
-    let mut init_script = String::from(
-        "set -e; \
-         sudo groupmod -g $HOST_GID claude 2>/dev/null || true; \
-         sudo usermod -u $HOST_UID claude 2>/dev/null || true; "
-    );
+    let mut init_script = String::from("set -e; ");
 
     // Mount and copy Claude config directory if it exists
     let claude_dir = PathBuf::from(&home).join(".claude");
@@ -462,8 +471,9 @@ pub fn run_container(worktree_path: &Path, image_name: &str, prompt: Option<&str
             format!("{}:/tmp/.claude-host:ro", claude_dir.display()),
         ]);
         init_script.push_str(
-            "cp -a /tmp/.claude-host ~/.claude; \
-             sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"npm-global\"/g' ~/.claude/*.json 2>/dev/null || true; "
+            "sudo rm -rf ~/.claude && sudo cp -a /tmp/.claude-host ~/.claude; \
+             sudo chown -R claude:claude ~/.claude; \
+             sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"native\"/g' ~/.claude/*.json 2>/dev/null || true; ",
         );
     }
 
@@ -475,8 +485,9 @@ pub fn run_container(worktree_path: &Path, image_name: &str, prompt: Option<&str
             format!("{}:/tmp/.claude-host.json:ro", claude_json.display()),
         ]);
         init_script.push_str(
-            "cp /tmp/.claude-host.json ~/.claude.json; \
-             sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"npm-global\"/g' ~/.claude.json 2>/dev/null || true; "
+            "sudo cp /tmp/.claude-host.json ~/.claude.json; \
+             sudo chown claude:claude ~/.claude.json; \
+             sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"native\"/g' ~/.claude.json 2>/dev/null || true; ",
         );
     }
 
@@ -503,15 +514,16 @@ pub fn run_container(worktree_path: &Path, image_name: &str, prompt: Option<&str
   }
 }
 SETTINGS
-"#
+"#,
     );
 
     // Add prompt via environment variable if provided
     if let Some(p) = prompt {
         args.extend(["-e".to_string(), format!("CLAUDE_PROMPT={}", p)]);
-        init_script.push_str(r#"exec claude --permission-mode acceptEdits -p "$CLAUDE_PROMPT""#);
+        init_script
+            .push_str(r#"exec claude --permission-mode bypassPermissions -p "$CLAUDE_PROMPT""#);
     } else {
-        init_script.push_str("exec claude --permission-mode acceptEdits");
+        init_script.push_str("exec claude --permission-mode bypassPermissions");
     }
 
     args.extend([
@@ -544,7 +556,6 @@ pub fn run_container_with_output(
 ) -> Result<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-    let (host_uid, host_gid) = get_host_uid_gid();
 
     let mut args = vec![
         "run".to_string(),
@@ -557,19 +568,10 @@ pub fn run_container_with_output(
         format!("ANTHROPIC_API_KEY={}", api_key),
         "-e".to_string(),
         format!("CLAUDE_PROMPT={}", prompt),
-        "-e".to_string(),
-        format!("HOST_UID={}", host_uid),
-        "-e".to_string(),
-        format!("HOST_GID={}", host_gid),
     ];
 
     // Build init script for container startup
-    // First, update claude user UID/GID to match host user for proper file permissions
-    let mut init_script = String::from(
-        "set -e; \
-         sudo groupmod -g $HOST_GID claude 2>/dev/null || true; \
-         sudo usermod -u $HOST_UID claude 2>/dev/null || true; "
-    );
+    let mut init_script = String::from("set -e; ");
 
     // Mount and copy Claude config directory if it exists
     let claude_dir = PathBuf::from(&home).join(".claude");
@@ -579,8 +581,9 @@ pub fn run_container_with_output(
             format!("{}:/tmp/.claude-host:ro", claude_dir.display()),
         ]);
         init_script.push_str(
-            "cp -a /tmp/.claude-host ~/.claude; \
-             sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"npm-global\"/g' ~/.claude/*.json 2>/dev/null || true; ",
+            "sudo rm -rf ~/.claude && sudo cp -a /tmp/.claude-host ~/.claude; \
+             sudo chown -R claude:claude ~/.claude; \
+             sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"native\"/g' ~/.claude/*.json 2>/dev/null || true; ",
         );
     }
 
@@ -592,8 +595,9 @@ pub fn run_container_with_output(
             format!("{}:/tmp/.claude-host.json:ro", claude_json.display()),
         ]);
         init_script.push_str(
-            "cp /tmp/.claude-host.json ~/.claude.json; \
-             sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"npm-global\"/g' ~/.claude.json 2>/dev/null || true; ",
+            "sudo cp /tmp/.claude-host.json ~/.claude.json; \
+             sudo chown claude:claude ~/.claude.json; \
+             sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"native\"/g' ~/.claude.json 2>/dev/null || true; ",
         );
     }
 
@@ -713,7 +717,9 @@ SETTINGS
     spinner_thread.join().expect("spinner thread panicked");
 
     // Wait for process to exit
-    let status = child.wait().context("Failed to wait for docker container")?;
+    let status = child
+        .wait()
+        .context("Failed to wait for docker container")?;
 
     // Ensure terminal is reset
     reset_terminal();

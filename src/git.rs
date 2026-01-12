@@ -1,6 +1,6 @@
 //! Git utility functions for worktree and repository management.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,8 +47,7 @@ pub fn get_bare_repo_info() -> Result<Option<BareRepoInfo>> {
     let git_dir_path = PathBuf::from(&git_dir);
 
     // Get absolute path of git dir
-    let git_dir_abs = fs::canonicalize(&git_dir_path)
-        .unwrap_or_else(|_| git_dir_path.clone());
+    let git_dir_abs = fs::canonicalize(&git_dir_path).unwrap_or_else(|_| git_dir_path.clone());
 
     // Check if git dir ends with .bare (our convention)
     if !git_dir_abs.ends_with(".bare") {
@@ -100,9 +99,10 @@ pub fn get_main_branch() -> Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         if line.contains("HEAD branch")
-            && let Some(branch) = line.split_whitespace().last() {
-                return Ok(branch.to_string());
-            }
+            && let Some(branch) = line.split_whitespace().last()
+        {
+            return Ok(branch.to_string());
+        }
     }
 
     Ok("main".to_string())
@@ -113,7 +113,13 @@ pub fn create_worktree(repo_root: &Path, worktree_name: &str) -> Result<PathBuf>
     let worktree_path = repo_root.parent().unwrap().join(worktree_name);
 
     let status = Command::new("git")
-        .args(["worktree", "add", worktree_path.to_str().unwrap(), "-b", worktree_name])
+        .args([
+            "worktree",
+            "add",
+            worktree_path.to_str().unwrap(),
+            "-b",
+            worktree_name,
+        ])
         .status()
         .context("Failed to create worktree")?;
 
@@ -143,9 +149,10 @@ pub fn list_claude_worktrees() -> Result<Vec<Worktree>> {
             current_branch = Some(branch.to_string());
         } else if line.is_empty() {
             if let (Some(path), Some(branch)) = (current_path.take(), current_branch.take())
-                && branch.starts_with(WORKTREE_PREFIX) {
-                    worktrees.push(Worktree { path, branch });
-                }
+                && branch.starts_with(WORKTREE_PREFIX)
+            {
+                worktrees.push(Worktree { path, branch });
+            }
             current_path = None;
             current_branch = None;
         }
@@ -153,9 +160,10 @@ pub fn list_claude_worktrees() -> Result<Vec<Worktree>> {
 
     // Handle last entry if no trailing newline
     if let (Some(path), Some(branch)) = (current_path, current_branch)
-        && branch.starts_with(WORKTREE_PREFIX) {
-            worktrees.push(Worktree { path, branch });
-        }
+        && branch.starts_with(WORKTREE_PREFIX)
+    {
+        worktrees.push(Worktree { path, branch });
+    }
 
     Ok(worktrees)
 }
@@ -244,9 +252,7 @@ pub fn is_worktree_unused(worktree_path: &Path) -> Result<bool> {
         .output()?;
 
     let untracked_output = String::from_utf8_lossy(&untracked.stdout);
-    let has_untracked = untracked_output
-        .lines()
-        .any(|f| !f.starts_with(".claude/"));
+    let has_untracked = untracked_output.lines().any(|f| !f.starts_with(".claude/"));
 
     if has_untracked {
         return Ok(false);
@@ -258,7 +264,11 @@ pub fn is_worktree_unused(worktree_path: &Path) -> Result<bool> {
 
     let commits_ahead = Command::new("git")
         .current_dir(worktree_path)
-        .args(["rev-list", "--count", &format!("origin/{}..{}", main_branch, branch)])
+        .args([
+            "rev-list",
+            "--count",
+            &format!("origin/{}..{}", main_branch, branch),
+        ])
         .output()?;
 
     let count: i32 = String::from_utf8_lossy(&commits_ahead.stdout)
@@ -285,14 +295,17 @@ pub fn remove_worktree(worktree_path: &Path, delete_branch: bool) -> Result<()> 
     let branch = get_worktree_branch(worktree_path)?;
 
     Command::new("git")
-        .args(["worktree", "remove", worktree_path.to_str().unwrap(), "--force"])
+        .args([
+            "worktree",
+            "remove",
+            worktree_path.to_str().unwrap(),
+            "--force",
+        ])
         .status()
         .context("Failed to remove worktree")?;
 
     if delete_branch {
-        let _ = Command::new("git")
-            .args(["branch", "-D", &branch])
-            .status();
+        let _ = Command::new("git").args(["branch", "-D", &branch]).status();
     }
 
     Ok(())
