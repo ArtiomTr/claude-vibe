@@ -1,14 +1,39 @@
 //! Docker utility functions for building images and running containers.
 
 use anyhow::{bail, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use nix::unistd::{Gid, Uid};
 use serde::Deserialize;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Get the current user's UID and GID
+fn get_host_uid_gid() -> (u32, u32) {
+    (Uid::current().as_raw(), Gid::current().as_raw())
+}
+
 use crate::git;
+
+/// Maximum number of output lines to display
+const MAX_OUTPUT_LINES: usize = 5;
+
+/// Box drawing characters
+const BOX_VERTICAL: &str = "│";
+const BOX_CORNER_BOTTOM: &str = "╰";
+const BOX_HORIZONTAL: &str = "─";
+
+/// Spinner characters (braille pattern)
+const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Get terminal width, defaulting to 80 if unavailable
+fn get_terminal_width() -> usize {
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(80)
+}
 
 /// Claude stream-json event types
 #[derive(Debug, Deserialize)]
@@ -21,7 +46,13 @@ enum ClaudeEvent {
     User { message: UserMessage },
     #[serde(rename = "result")]
     Result { result: String, cost_usd: Option<f64> },
-    System { message: String },
+    /// System events - can have either a message string or a subtype (like "init")
+    System {
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        subtype: Option<String>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -43,46 +74,243 @@ struct UserMessage {
 enum ContentBlock {
     Text { text: String },
     ToolUse { name: String, input: serde_json::Value },
-    ToolResult { tool_use_id: String, content: String },
+    /// Tool results can have content as string or array of objects
+    ToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: serde_json::Value,
+    },
     #[serde(other)]
     Unknown,
 }
 
-/// Display a Claude event in human-readable format
-fn display_event(event: &ClaudeEvent, spinner: &ProgressBar) {
+/// Collected output line with its display content
+struct OutputLine {
+    /// The formatted content (without color codes for gradient application)
+    content: String,
+    /// Whether this is a tool use line (uses yellow) or text line (uses cyan)
+    is_tool: bool,
+}
+
+/// State for streaming output display
+struct StreamingDisplay {
+    lines: Vec<OutputLine>,
+    displayed_count: usize,
+    spinner_idx: usize,
+    header_printed: bool,
+    final_result: Option<String>,
+    finished: bool,
+}
+
+impl StreamingDisplay {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            displayed_count: 0,
+            spinner_idx: 0,
+            header_printed: false,
+            final_result: None,
+            finished: false,
+        }
+    }
+
+    /// Advance spinner and redraw (only if not finished)
+    fn tick(&mut self) {
+        if !self.finished {
+            self.spinner_idx = (self.spinner_idx + 1) % SPINNER_CHARS.len();
+            self.redraw();
+        }
+    }
+
+    /// Add a line and redraw the display
+    fn add_line(&mut self, line: OutputLine) {
+        if !self.finished {
+            self.lines.push(line);
+            self.redraw();
+        }
+    }
+
+    /// Set the final result and redraw in finished state
+    fn set_final_result(&mut self, result: String) {
+        self.final_result = Some(result);
+        self.finished = true;
+        self.redraw();
+    }
+
+    /// Mark as finished without a result message
+    fn finish(&mut self) {
+        self.finished = true;
+        self.redraw();
+    }
+
+    /// Truncate a string to fit within terminal width (accounting for prefix)
+    fn truncate_to_width(s: &str, max_width: usize) -> String {
+        if s.chars().count() <= max_width {
+            s.to_string()
+        } else {
+            let truncated: String = s.chars().take(max_width.saturating_sub(3)).collect();
+            format!("{}...", truncated)
+        }
+    }
+
+    /// Redraw the header, visible lines, and closing line
+    fn redraw(&mut self) {
+        let width = get_terminal_width();
+        // Reserve space for "│ " prefix (2 chars) + some margin
+        let content_width = width.saturating_sub(4);
+
+        // Calculate how many lines to move up (header + output lines + closing line)
+        let lines_to_clear = if self.header_printed {
+            1 + self.displayed_count + 1 // header + output lines + closing line
+        } else {
+            0
+        };
+
+        // Move cursor up and clear lines
+        for _ in 0..lines_to_clear {
+            print!("\x1b[A\x1b[2K"); // Move up, clear line
+        }
+
+        if self.finished {
+            // Finished state: checkmark + collapsed view
+            println!(
+                "\x1b[32m✓ Claude analyzed your project\x1b[0m"
+            );
+            self.header_printed = true;
+
+            // Show final result if available
+            if let Some(ref result) = self.final_result {
+                // Truncate result to single line if needed
+                let display_result = Self::truncate_to_width(result, content_width);
+                println!(
+                    "\x1b[90m{}\x1b[0m \x1b[36m{}\x1b[0m",
+                    BOX_VERTICAL, display_result
+                );
+                self.displayed_count = 1;
+            } else {
+                self.displayed_count = 0;
+            }
+
+            // Print closing line
+            let padding: String = BOX_HORIZONTAL.repeat(width.saturating_sub(1));
+            println!("\x1b[90m{}{}\x1b[0m", BOX_CORNER_BOTTOM, padding);
+        } else {
+            // Active state: spinner + streaming lines
+            let spinner_char = SPINNER_CHARS[self.spinner_idx];
+
+            println!(
+                "\x1b[36m{} Claude is analyzing your project...\x1b[0m",
+                spinner_char
+            );
+            self.header_printed = true;
+
+            // Print visible output lines
+            let total = self.lines.len();
+            let start = total.saturating_sub(MAX_OUTPUT_LINES);
+            let visible_lines = &self.lines[start..];
+
+            for (i, line) in visible_lines.iter().enumerate() {
+                let gradient_intensity = if visible_lines.len() > 2 {
+                    match i {
+                        0 => 2, // Darkest (first line)
+                        1 => 1, // Medium dark (second line)
+                        _ => 0, // Normal (rest)
+                    }
+                } else {
+                    0 // No gradient if 2 or fewer lines
+                };
+
+                let (prefix_color, text_color) = match gradient_intensity {
+                    2 => ("\x1b[38;5;238m", "\x1b[38;5;240m"), // Very dark gray
+                    1 => ("\x1b[38;5;243m", "\x1b[38;5;245m"), // Medium gray
+                    _ => {
+                        if line.is_tool {
+                            ("\x1b[90m", "\x1b[33m") // Normal: gray pipe, yellow text for tools
+                        } else {
+                            ("\x1b[90m", "\x1b[36m") // Normal: gray pipe, cyan text for messages
+                        }
+                    }
+                };
+
+                // Truncate content to fit terminal width
+                let truncated_content = Self::truncate_to_width(&line.content, content_width);
+
+                println!(
+                    "{}{}\x1b[0m {}{}\x1b[0m",
+                    prefix_color, BOX_VERTICAL, text_color, truncated_content
+                );
+            }
+
+            // Print closing line
+            let padding: String = BOX_HORIZONTAL.repeat(width.saturating_sub(1));
+            println!("\x1b[90m{}{}\x1b[0m", BOX_CORNER_BOTTOM, padding);
+
+            self.displayed_count = visible_lines.len();
+        }
+
+        // Flush to ensure output is displayed immediately
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Print the closing box line padded to terminal width
+fn print_closing_line() {
+    let width = get_terminal_width();
+    // BOX_CORNER_BOTTOM is 3 bytes but 1 char, BOX_HORIZONTAL is 3 bytes but 1 char
+    let padding_count = width.saturating_sub(1); // -1 for the corner
+    let padding: String = BOX_HORIZONTAL.repeat(padding_count);
+    println!("\x1b[90m{}{}\x1b[0m", BOX_CORNER_BOTTOM, padding);
+}
+
+/// Reset terminal colors (used for cleanup on Ctrl+C)
+fn reset_terminal() {
+    print!("\x1b[0m");
+    let _ = std::io::stdout().flush();
+}
+
+/// Process a Claude event: collect lines, handle result, return cost if present
+fn process_event(event: &ClaudeEvent, display: &Mutex<StreamingDisplay>) -> Option<f64> {
     match event {
         ClaudeEvent::Assistant { message } => {
             for block in &message.content {
                 match block {
                     ContentBlock::Text { text } => {
-                        spinner.suspend(|| {
-                            println!("\x1b[36mClaude:\x1b[0m {}", text);
+                        display.lock().unwrap().add_line(OutputLine {
+                            content: text.clone(),
+                            is_tool: false,
                         });
                     }
                     ContentBlock::ToolUse { name, input } => {
-                        spinner.set_message(format!("Running {}...", name));
                         let input_summary = summarize_tool_input(name, input);
-                        spinner.suspend(|| {
-                            println!("\x1b[33m> {}\x1b[0m {}", name, input_summary);
+                        display.lock().unwrap().add_line(OutputLine {
+                            content: format!("> {} {}", name, input_summary),
+                            is_tool: true,
                         });
                     }
                     _ => {}
                 }
             }
+            None
         }
-        ClaudeEvent::Result { cost_usd, .. } => {
-            if let Some(cost) = cost_usd {
-                spinner.suspend(|| {
-                    println!("\x1b[90mCost: ${:.4}\x1b[0m", cost);
-                });
+        ClaudeEvent::Result { result, cost_usd } => {
+            // Set the final result and collapse the display
+            let final_text = result.trim().to_string();
+            if !final_text.is_empty() {
+                display.lock().unwrap().set_final_result(final_text);
+            } else {
+                display.lock().unwrap().finish();
             }
+            *cost_usd
         }
-        ClaudeEvent::System { message } => {
-            spinner.suspend(|| {
-                println!("\x1b[90m[System] {}\x1b[0m", message);
-            });
+        ClaudeEvent::System { subtype, .. } => {
+            // Skip system init events (they're internal setup messages)
+            if subtype.as_deref() == Some("init") {
+                return None;
+            }
+            // Skip other system messages for now (they're usually internal)
+            None
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -200,6 +428,7 @@ fn build_image_from(dockerfile: &Path, context: &Path, image_name: &str) -> Resu
 pub fn run_container(worktree_path: &Path, image_name: &str, prompt: Option<&str>) -> Result<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let (host_uid, host_gid) = get_host_uid_gid();
 
     let mut args = vec![
         "run".to_string(),
@@ -211,10 +440,19 @@ pub fn run_container(worktree_path: &Path, image_name: &str, prompt: Option<&str
         "/workspace".to_string(),
         "-e".to_string(),
         format!("ANTHROPIC_API_KEY={}", api_key),
+        "-e".to_string(),
+        format!("HOST_UID={}", host_uid),
+        "-e".to_string(),
+        format!("HOST_GID={}", host_gid),
     ];
 
     // Build init script for container startup
-    let mut init_script = String::from("set -e; ");
+    // First, update claude user UID/GID to match host user for proper file permissions
+    let mut init_script = String::from(
+        "set -e; \
+         sudo groupmod -g $HOST_GID claude 2>/dev/null || true; \
+         sudo usermod -u $HOST_UID claude 2>/dev/null || true; "
+    );
 
     // Mount and copy Claude config directory if it exists
     let claude_dir = PathBuf::from(&home).join(".claude");
@@ -224,8 +462,7 @@ pub fn run_container(worktree_path: &Path, image_name: &str, prompt: Option<&str
             format!("{}:/tmp/.claude-host:ro", claude_dir.display()),
         ]);
         init_script.push_str(
-            "sudo cp -a /tmp/.claude-host ~/.claude && \
-             sudo chown -R $(id -u):$(id -g) ~/.claude; \
+            "cp -a /tmp/.claude-host ~/.claude; \
              sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"npm-global\"/g' ~/.claude/*.json 2>/dev/null || true; "
         );
     }
@@ -238,8 +475,7 @@ pub fn run_container(worktree_path: &Path, image_name: &str, prompt: Option<&str
             format!("{}:/tmp/.claude-host.json:ro", claude_json.display()),
         ]);
         init_script.push_str(
-            "sudo cp /tmp/.claude-host.json ~/.claude.json && \
-             sudo chown $(id -u):$(id -g) ~/.claude.json; \
+            "cp /tmp/.claude-host.json ~/.claude.json; \
              sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"npm-global\"/g' ~/.claude.json 2>/dev/null || true; "
         );
     }
@@ -308,6 +544,7 @@ pub fn run_container_with_output(
 ) -> Result<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let (host_uid, host_gid) = get_host_uid_gid();
 
     let mut args = vec![
         "run".to_string(),
@@ -320,10 +557,19 @@ pub fn run_container_with_output(
         format!("ANTHROPIC_API_KEY={}", api_key),
         "-e".to_string(),
         format!("CLAUDE_PROMPT={}", prompt),
+        "-e".to_string(),
+        format!("HOST_UID={}", host_uid),
+        "-e".to_string(),
+        format!("HOST_GID={}", host_gid),
     ];
 
     // Build init script for container startup
-    let mut init_script = String::from("set -e; ");
+    // First, update claude user UID/GID to match host user for proper file permissions
+    let mut init_script = String::from(
+        "set -e; \
+         sudo groupmod -g $HOST_GID claude 2>/dev/null || true; \
+         sudo usermod -u $HOST_UID claude 2>/dev/null || true; "
+    );
 
     // Mount and copy Claude config directory if it exists
     let claude_dir = PathBuf::from(&home).join(".claude");
@@ -333,8 +579,7 @@ pub fn run_container_with_output(
             format!("{}:/tmp/.claude-host:ro", claude_dir.display()),
         ]);
         init_script.push_str(
-            "sudo cp -a /tmp/.claude-host ~/.claude && \
-             sudo chown -R $(id -u):$(id -g) ~/.claude; \
+            "cp -a /tmp/.claude-host ~/.claude; \
              sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"npm-global\"/g' ~/.claude/*.json 2>/dev/null || true; ",
         );
     }
@@ -347,8 +592,7 @@ pub fn run_container_with_output(
             format!("{}:/tmp/.claude-host.json:ro", claude_json.display()),
         ]);
         init_script.push_str(
-            "sudo cp /tmp/.claude-host.json ~/.claude.json && \
-             sudo chown $(id -u):$(id -g) ~/.claude.json; \
+            "cp /tmp/.claude-host.json ~/.claude.json; \
              sed -i 's/\"installMethod\":[^,}]*/\"installMethod\":\"npm-global\"/g' ~/.claude.json 2>/dev/null || true; ",
         );
     }
@@ -391,16 +635,33 @@ SETTINGS
         init_script,
     ]);
 
-    // Create spinner for progress indication
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    spinner.set_message("Claude is analyzing the project...");
-    spinner.enable_steady_tick(Duration::from_millis(100));
+    // Set up Ctrl+C handler to clean up terminal
+    let _ = ctrlc::set_handler(move || {
+        reset_terminal();
+        println!(); // New line after any partial output
+        print_closing_line();
+        std::process::exit(130); // Standard exit code for Ctrl+C
+    });
+
+    // Streaming display state and cost
+    let display = Arc::new(Mutex::new(StreamingDisplay::new()));
+    let cost_usd = Arc::new(Mutex::new(None::<f64>));
+    let spinner_running = Arc::new(AtomicBool::new(true));
+
+    // Start spinner thread
+    let display_spinner = Arc::clone(&display);
+    let spinner_flag = Arc::clone(&spinner_running);
+    let spinner_thread = std::thread::spawn(move || {
+        // Initial draw
+        display_spinner.lock().unwrap().redraw();
+
+        while spinner_flag.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(80));
+            if spinner_flag.load(Ordering::SeqCst) {
+                display_spinner.lock().unwrap().tick();
+            }
+        }
+    });
 
     // Spawn docker process and capture output
     let mut child = Command::new("docker")
@@ -414,37 +675,30 @@ SETTINGS
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let stderr = child.stderr.take().expect("Failed to capture stderr");
 
-    let spinner_clone = spinner.clone();
+    let display_clone = Arc::clone(&display);
+    let cost_clone = Arc::clone(&cost_usd);
     let stdout_thread = std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             if let Ok(line) = line {
                 // Try to parse as Claude stream-json event
-                match serde_json::from_str::<ClaudeEvent>(&line) {
-                    Ok(event) => display_event(&event, &spinner_clone),
-                    Err(_) => {
-                        // Not JSON or unknown format, display as-is if non-empty
-                        if !line.trim().is_empty() {
-                            spinner_clone.suspend(|| {
-                                println!("{}", line);
-                            });
-                        }
+                if let Ok(event) = serde_json::from_str::<ClaudeEvent>(&line) {
+                    if let Some(cost) = process_event(&event, &display_clone) {
+                        *cost_clone.lock().unwrap() = Some(cost);
                     }
                 }
+                // Silently ignore unparseable JSON lines (internal Claude messages)
             }
         }
     });
 
-    let spinner_clone = spinner.clone();
     let stderr_thread = std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
             if let Ok(line) = line {
                 // stderr is usually error messages or status, display as-is
                 if !line.trim().is_empty() {
-                    spinner_clone.suspend(|| {
-                        eprintln!("\x1b[31m{}\x1b[0m", line);
-                    });
+                    eprintln!("\x1b[31m{}\x1b[0m", line);
                 }
             }
         }
@@ -454,10 +708,20 @@ SETTINGS
     stdout_thread.join().expect("stdout thread panicked");
     stderr_thread.join().expect("stderr thread panicked");
 
+    // Stop spinner thread
+    spinner_running.store(false, Ordering::SeqCst);
+    spinner_thread.join().expect("spinner thread panicked");
+
     // Wait for process to exit
     let status = child.wait().context("Failed to wait for docker container")?;
 
-    spinner.finish_and_clear();
+    // Ensure terminal is reset
+    reset_terminal();
+
+    // Display cost if available
+    if let Some(cost) = *cost_usd.lock().unwrap() {
+        println!("\x1b[90m  Cost: ${:.4}\x1b[0m", cost);
+    }
 
     if !status.success() {
         bail!("Docker container exited with error");
