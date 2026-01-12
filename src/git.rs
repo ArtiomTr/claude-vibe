@@ -110,7 +110,7 @@ pub fn get_main_branch() -> Result<String> {
 
 /// Create a new git worktree with the given name.
 pub fn create_worktree(repo_root: &Path, worktree_name: &str) -> Result<PathBuf> {
-    let worktree_path = repo_root.parent().unwrap().join(worktree_name);
+    let worktree_path = repo_root.join(worktree_name);
 
     let status = Command::new("git")
         .args([

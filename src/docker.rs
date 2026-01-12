@@ -521,9 +521,9 @@ SETTINGS
     if let Some(p) = prompt {
         args.extend(["-e".to_string(), format!("CLAUDE_PROMPT={}", p)]);
         init_script
-            .push_str(r#"exec claude --permission-mode bypassPermissions -p "$CLAUDE_PROMPT""#);
+            .push_str(r#"exec claude --permission-mode acceptEdits -p "$CLAUDE_PROMPT""#);
     } else {
-        init_script.push_str("exec claude --permission-mode bypassPermissions");
+        init_script.push_str("exec claude --permission-mode acceptEdits");
     }
 
     args.extend([
