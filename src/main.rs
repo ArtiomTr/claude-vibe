@@ -6,6 +6,8 @@
 mod commands;
 mod docker;
 mod git;
+mod style;
+mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -41,24 +43,34 @@ enum Commands {
         worktree_name: Option<String>,
     },
 
-    /// Remove worktrees that are pushed and synced with remote
-    Cleanup,
+    /// Remove worktrees that are synced with remote or unused
+    Cleanup {
+        /// Interactive mode: select worktrees to delete with TUI
+        #[arg(short, long)]
+        interactive: bool,
+    },
 
     /// Initialize Dockerfile.vibes for a project
     Setup,
+
+    /// Show status of all worktrees
+    #[command(visible_aliases = ["stat", "ls"])]
+    Status,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Some(Commands::Clone { url, directory }) => commands::clone::run(&url, directory),
         Some(Commands::New) => commands::new::run(),
         Some(Commands::Continue { worktree_name }) => {
-            commands::continue_session::run(worktree_name)
+            commands::continue_session::run(worktree_name).await
         }
-        Some(Commands::Cleanup) => commands::cleanup::run(),
+        Some(Commands::Cleanup { interactive }) => commands::cleanup::run(interactive).await,
         Some(Commands::Setup) => commands::setup::run(),
+        Some(Commands::Status) => commands::status::run().await,
         None => {
             // Default to help
             use clap::CommandFactory;

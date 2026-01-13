@@ -5,3 +5,4 @@ pub mod clone;
 pub mod continue_session;
 pub mod new;
 pub mod setup;
+pub mod status;

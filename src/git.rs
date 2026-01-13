@@ -11,6 +11,7 @@ use crate::WORKTREE_PREFIX;
 pub const DEFAULT_IMAGE: &str = "sirsedev/claude-vibe";
 
 /// Information about a git worktree
+#[derive(Clone)]
 pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
@@ -291,21 +292,30 @@ pub fn get_worktree_branch(worktree_path: &Path) -> Result<String> {
 }
 
 /// Remove a worktree and optionally its branch.
-pub fn remove_worktree(worktree_path: &Path, delete_branch: bool) -> Result<()> {
-    let branch = get_worktree_branch(worktree_path)?;
-
-    Command::new("git")
-        .args([
-            "worktree",
-            "remove",
-            worktree_path.to_str().unwrap(),
-            "--force",
-        ])
-        .status()
-        .context("Failed to remove worktree")?;
+///
+/// Handles both existing worktrees and orphaned ones (where directory was deleted).
+pub fn remove_worktree_with_branch(worktree_path: &Path, branch: &str, delete_branch: bool) -> Result<()> {
+    if worktree_path.exists() {
+        // Normal removal for existing worktree
+        Command::new("git")
+            .args([
+                "worktree",
+                "remove",
+                worktree_path.to_str().unwrap(),
+                "--force",
+            ])
+            .status()
+            .context("Failed to remove worktree")?;
+    } else {
+        // For orphaned worktrees (directory deleted), use prune
+        Command::new("git")
+            .args(["worktree", "prune"])
+            .status()
+            .context("Failed to prune worktrees")?;
+    }
 
     if delete_branch {
-        let _ = Command::new("git").args(["branch", "-D", &branch]).status();
+        let _ = Command::new("git").args(["branch", "-D", branch]).status();
     }
 
     Ok(())
@@ -318,4 +328,181 @@ pub fn is_git_repo() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Get AI-generated summary of workspace changes using Claude CLI.
+///
+/// Returns None if there are no changes or if Claude CLI fails.
+pub fn get_ai_summary(worktree_path: &Path) -> Option<String> {
+    // Get git diff stats
+    let diff_output = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["diff", "--stat", "HEAD"])
+        .output()
+        .ok()?;
+    let diff_stat = String::from_utf8_lossy(&diff_output.stdout);
+
+    // Get status
+    let status_output = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    let status = String::from_utf8_lossy(&status_output.stdout);
+
+    if diff_stat.trim().is_empty() && status.trim().is_empty() {
+        return None;
+    }
+
+    let changes_context = format!("Status:\n{}\n\nDiff stats:\n{}", status, diff_stat);
+
+    let prompt = format!(
+        "Summarize these git changes in one concise line (max 60 chars). \
+         Focus on what was changed, not file names. \
+         If no changes, say 'No changes'. Changes:\n{}",
+        changes_context
+    );
+
+    let output = Command::new("claude")
+        .args(["--model", "haiku", "-p", &prompt])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let summary = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Take only the first line if multi-line
+    let first_line = summary.lines().next().unwrap_or(&summary).to_string();
+
+    // Truncate to 60 chars if needed
+    if first_line.chars().count() > 60 {
+        let truncated: String = first_line.chars().take(57).collect();
+        Some(format!("{}...", truncated))
+    } else {
+        Some(first_line)
+    }
+}
+
+/// Status of a worktree's changes
+#[derive(Clone, Default)]
+pub struct WorktreeStatus {
+    /// Worktree directory was deleted but git still tracks it
+    pub is_orphaned: bool,
+    /// Has uncommitted changes (modified, staged, or untracked files)
+    pub has_uncommitted: bool,
+    /// Has commits not pushed to remote
+    pub has_unpushed: bool,
+    /// Number of commits ahead of remote
+    pub commits_ahead: usize,
+    /// Number of modified files
+    pub modified_files: usize,
+    /// Number of untracked files
+    pub untracked_files: usize,
+}
+
+impl WorktreeStatus {
+    /// Returns true if the worktree has any local changes (uncommitted or unpushed)
+    pub fn has_local_changes(&self) -> bool {
+        self.has_uncommitted || self.has_unpushed
+    }
+
+    /// Returns true if the worktree is safe to delete (no local changes or orphaned)
+    pub fn is_safe_to_delete(&self) -> bool {
+        self.is_orphaned || !self.has_local_changes()
+    }
+}
+
+/// Get the status of a worktree (uncommitted changes, unpushed commits).
+pub fn get_worktree_status(worktree_path: &Path) -> Result<WorktreeStatus> {
+    let mut status = WorktreeStatus::default();
+
+    // Check if directory exists - if not, it's an orphaned worktree
+    if !worktree_path.exists() {
+        status.is_orphaned = true;
+        return Ok(status);
+    }
+
+    // Check for modified files (unstaged)
+    let diff = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["diff", "--name-only"])
+        .output()?;
+    let modified = String::from_utf8_lossy(&diff.stdout);
+    let modified_count = modified.lines().filter(|l| !l.is_empty()).count();
+
+    // Check for staged files
+    let staged = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["diff", "--cached", "--name-only"])
+        .output()?;
+    let staged_output = String::from_utf8_lossy(&staged.stdout);
+    let staged_count = staged_output.lines().filter(|l| !l.is_empty()).count();
+
+    // Check for untracked files (excluding .claude directory)
+    let untracked = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()?;
+    let untracked_output = String::from_utf8_lossy(&untracked.stdout);
+    let untracked_count = untracked_output
+        .lines()
+        .filter(|f| !f.is_empty() && !f.starts_with(".claude/"))
+        .count();
+
+    status.modified_files = modified_count + staged_count;
+    status.untracked_files = untracked_count;
+    status.has_uncommitted = status.modified_files > 0 || status.untracked_files > 0;
+
+    // Check commits ahead of remote
+    let branch = get_worktree_branch(worktree_path)?;
+
+    // First check if remote branch exists
+    let remote_check = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["ls-remote", "--exit-code", "--heads", "origin", &branch])
+        .output()?;
+
+    if remote_check.status.success() {
+        // Remote branch exists, check how many commits ahead
+        let commits_ahead = Command::new("git")
+            .current_dir(worktree_path)
+            .args([
+                "rev-list",
+                "--count",
+                &format!("origin/{}..HEAD", branch),
+            ])
+            .output()?;
+
+        let count: usize = String::from_utf8_lossy(&commits_ahead.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+
+        status.commits_ahead = count;
+        status.has_unpushed = count > 0;
+    } else {
+        // Remote branch doesn't exist, check if we have any commits beyond main
+        let main_branch = get_main_branch().unwrap_or_else(|_| "main".to_string());
+        let commits_ahead = Command::new("git")
+            .current_dir(worktree_path)
+            .args([
+                "rev-list",
+                "--count",
+                &format!("origin/{}..HEAD", main_branch),
+            ])
+            .output()?;
+
+        let count: usize = String::from_utf8_lossy(&commits_ahead.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+
+        status.commits_ahead = count;
+        status.has_unpushed = count > 0;
+    }
+
+    Ok(status)
 }
