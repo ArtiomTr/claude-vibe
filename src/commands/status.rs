@@ -67,33 +67,35 @@ pub async fn run() -> Result<()> {
 
         // Build status details
         if status.is_orphaned {
-            print!("    ");
+            print!("  ");
             style::println_colored("Orphaned - directory missing", style::indicators::DANGER);
         } else {
-            let mut details = Vec::new();
-
-            if status.modified_files > 0 {
-                details.push(format!("{} modified", status.modified_files));
-            }
-            if status.untracked_files > 0 {
-                details.push(format!("{} untracked", status.untracked_files));
-            }
-            if status.commits_ahead > 0 {
-                details.push(format!("{} unpushed commit(s)", status.commits_ahead));
-            }
-
-            if details.is_empty() {
-                print!("    ");
-                style::println_colored("Clean - safe to delete", style::indicators::DIM);
-            } else {
-                print!("    ");
-                style::println_colored(&details.join(", "), style::indicators::DIM);
-            }
-
-            // Show AI summary if available
+            // Show AI summary first if available
             if let Some(summary) = summary {
-                print!("    ");
-                style::println_colored(summary, style::indicators::CYAN);
+                print!("  ");
+                style::println_colored(summary, style::indicators::DIM);
+            }
+
+            // Build compact status line (untracked files count as added)
+            let total_added = status.lines_added + status.untracked_files;
+            let has_changes = total_added > 0 || status.lines_deleted > 0;
+            let has_unpushed = status.commits_ahead > 0;
+
+            print!("  ");
+            if !has_changes && !has_unpushed {
+                style::println_colored("Clean", style::indicators::DIM);
+            } else {
+                let mut parts = Vec::new();
+                if total_added > 0 {
+                    parts.push(format!("+{}", total_added));
+                }
+                if status.lines_deleted > 0 {
+                    parts.push(format!("-{}", status.lines_deleted));
+                }
+                if has_unpushed {
+                    parts.push(format!("↑{}", status.commits_ahead));
+                }
+                style::println_colored(&parts.join(" "), style::indicators::DIM);
             }
         }
 

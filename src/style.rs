@@ -28,7 +28,6 @@ pub mod indicators {
     pub const UNPUSHED: Color = Color::Blue;
     pub const DANGER: Color = Color::Red;
     pub const DIM: Color = Color::DarkGrey;
-    pub const CYAN: Color = Color::Cyan;
 }
 
 /// Clear the current line (for updating loading messages).

@@ -1,9 +1,9 @@
 //! Continue an existing Claude Code session.
 
-use anyhow::{Result, bail};
-use std::io::{self, Write};
+use anyhow::{bail, Result};
+use tokio::sync::mpsc;
 
-use crate::{WORKTREE_PREFIX, docker, git, tui};
+use crate::{docker, git, tui, WORKTREE_PREFIX};
 
 /// Run the `continue` command: attach to an existing worktree session.
 pub async fn run(worktree_name: Option<String>) -> Result<()> {
@@ -21,38 +21,48 @@ pub async fn run(worktree_name: Option<String>) -> Result<()> {
                 bail!("No worktrees available");
             }
 
-            // Show loading message
-            print!("Loading worktree status...");
-            io::stdout().flush()?;
+            // Create items with just branch names (status will be loaded async)
+            let items: Vec<_> = worktrees
+                .iter()
+                .map(|wt| tui::WorktreeItem {
+                    branch: wt.branch.clone(),
+                    status: None,
+                    summary_state: tui::SummaryState::None,
+                })
+                .collect();
 
-            // Fetch statuses and summaries in parallel using tokio
-            let mut handles = Vec::new();
-            for wt in &worktrees {
+            // Create channel for async updates
+            let (update_tx, update_rx) = mpsc::unbounded_channel();
+
+            // Spawn background tasks to fetch status and summaries
+            for (index, wt) in worktrees.iter().enumerate() {
                 let path = wt.path.clone();
-                let branch = wt.branch.clone();
-                handles.push(tokio::task::spawn_blocking(move || {
+                let tx = update_tx.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    // First fetch status
                     let status = git::get_worktree_status(&path).unwrap_or_default();
-                    let summary = if status.has_uncommitted && !status.is_orphaned {
-                        git::get_ai_summary(&path)
-                    } else {
-                        None
-                    };
-                    tui::WorktreeItem { branch, status, summary }
-                }));
+                    let needs_summary = status.has_uncommitted && !status.is_orphaned;
+                    let _ = tx.send(tui::WorktreeUpdate::Status {
+                        index,
+                        status: status.clone(),
+                    });
+
+                    // Then fetch AI summary if needed
+                    if needs_summary {
+                        let _ = tx.send(tui::WorktreeUpdate::SummaryStarted { index });
+                        if let Some(summary) = git::get_ai_summary(&path) {
+                            let _ = tx.send(tui::WorktreeUpdate::Summary { index, summary });
+                        }
+                    }
+                });
             }
 
-            // Collect results
-            let mut items = Vec::with_capacity(handles.len());
-            for handle in handles {
-                items.push(handle.await?);
-            }
+            // Drop the original sender so the channel closes when all tasks complete
+            drop(update_tx);
 
-            // Clear loading message
-            print!("\r\x1b[K");
-            io::stdout().flush()?;
-
-            // Run interactive selection
-            let selection = tui::run_single_selection(items)?;
+            // Run interactive selection with async updates
+            let selection = tui::run_single_selection_async(items, update_rx).await?;
 
             match selection {
                 Some(idx) => worktrees[idx].branch.clone(),

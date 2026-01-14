@@ -1,7 +1,7 @@
 //! Clean up worktrees that are synced with remote or unused.
 
 use anyhow::Result;
-use std::io::{self, Write};
+use tokio::sync::mpsc;
 
 use crate::{git, style, tui};
 
@@ -74,37 +74,48 @@ fn run_automatic(worktrees: Vec<git::Worktree>) -> Result<()> {
 
 /// Run interactive cleanup with TUI selection
 async fn run_interactive(worktrees: Vec<git::Worktree>) -> Result<()> {
-    // Show loading message
-    print!("Loading worktree status...");
-    io::stdout().flush()?;
+    // Create items with just branch names (status will be loaded async)
+    let items: Vec<_> = worktrees
+        .iter()
+        .map(|wt| tui::WorktreeItem {
+            branch: wt.branch.clone(),
+            status: None,
+            summary_state: tui::SummaryState::None,
+        })
+        .collect();
 
-    // Fetch statuses and summaries in parallel using tokio
-    let mut handles = Vec::new();
-    for wt in &worktrees {
+    // Create channel for async updates
+    let (update_tx, update_rx) = mpsc::unbounded_channel();
+
+    // Spawn background tasks to fetch status and summaries
+    for (index, wt) in worktrees.iter().enumerate() {
         let path = wt.path.clone();
-        let branch = wt.branch.clone();
-        handles.push(tokio::task::spawn_blocking(move || {
+        let tx = update_tx.clone();
+
+        tokio::task::spawn_blocking(move || {
+            // First fetch status
             let status = git::get_worktree_status(&path).unwrap_or_default();
-            let summary = if status.has_uncommitted && !status.is_orphaned {
-                git::get_ai_summary(&path)
-            } else {
-                None
-            };
-            tui::WorktreeItem { branch, status, summary }
-        }));
+            let needs_summary = status.has_uncommitted && !status.is_orphaned;
+            let _ = tx.send(tui::WorktreeUpdate::Status {
+                index,
+                status: status.clone(),
+            });
+
+            // Then fetch AI summary if needed
+            if needs_summary {
+                let _ = tx.send(tui::WorktreeUpdate::SummaryStarted { index });
+                if let Some(summary) = git::get_ai_summary(&path) {
+                    let _ = tx.send(tui::WorktreeUpdate::Summary { index, summary });
+                }
+            }
+        });
     }
 
-    // Collect results
-    let mut items = Vec::with_capacity(handles.len());
-    for handle in handles {
-        items.push(handle.await?);
-    }
+    // Drop the original sender so the channel closes when all tasks complete
+    drop(update_tx);
 
-    // Clear loading message
-    style::clear_line();
-
-    // Run multi-selection TUI
-    let selection = tui::run_multi_selection(items)?;
+    // Run multi-selection TUI with async updates
+    let selection = tui::run_multi_selection_async(items, update_rx).await?;
 
     let Some(indices) = selection else {
         // User cancelled
@@ -138,16 +149,17 @@ async fn run_interactive(worktrees: Vec<git::Worktree>) -> Result<()> {
         for wt in &worktrees_with_changes {
             let status = git::get_worktree_status(&wt.path).unwrap_or_default();
             let mut details = Vec::new();
-            if status.modified_files > 0 {
-                details.push(format!("{} modified", status.modified_files));
+            let total_added = status.lines_added + status.untracked_files;
+            if total_added > 0 {
+                details.push(format!("+{}", total_added));
             }
-            if status.untracked_files > 0 {
-                details.push(format!("{} untracked", status.untracked_files));
+            if status.lines_deleted > 0 {
+                details.push(format!("-{}", status.lines_deleted));
             }
             if status.commits_ahead > 0 {
-                details.push(format!("{} unpushed", status.commits_ahead));
+                details.push(format!("↑{}", status.commits_ahead));
             }
-            println!("  - {} ({})", wt.branch, details.join(", "));
+            println!("  - {} ({})", wt.branch, details.join(" "));
         }
         println!();
 

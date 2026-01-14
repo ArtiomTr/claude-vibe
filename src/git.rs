@@ -397,8 +397,10 @@ pub struct WorktreeStatus {
     pub has_unpushed: bool,
     /// Number of commits ahead of remote
     pub commits_ahead: usize,
-    /// Number of modified files
-    pub modified_files: usize,
+    /// Number of lines added (from git diff)
+    pub lines_added: usize,
+    /// Number of lines deleted (from git diff)
+    pub lines_deleted: usize,
     /// Number of untracked files
     pub untracked_files: usize,
 }
@@ -415,6 +417,27 @@ impl WorktreeStatus {
     }
 }
 
+/// Parse git diff --numstat output to get total lines added and deleted.
+fn parse_numstat(output: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut deleted = 0usize;
+
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 2 {
+            // Binary files show "-" instead of numbers
+            if let Ok(a) = parts[0].parse::<usize>() {
+                added += a;
+            }
+            if let Ok(d) = parts[1].parse::<usize>() {
+                deleted += d;
+            }
+        }
+    }
+
+    (added, deleted)
+}
+
 /// Get the status of a worktree (uncommitted changes, unpushed commits).
 pub fn get_worktree_status(worktree_path: &Path) -> Result<WorktreeStatus> {
     let mut status = WorktreeStatus::default();
@@ -425,21 +448,15 @@ pub fn get_worktree_status(worktree_path: &Path) -> Result<WorktreeStatus> {
         return Ok(status);
     }
 
-    // Check for modified files (unstaged)
-    let diff = Command::new("git")
+    // Get lines added/deleted using git diff --numstat (unstaged + staged)
+    let diff_numstat = Command::new("git")
         .current_dir(worktree_path)
-        .args(["diff", "--name-only"])
+        .args(["diff", "HEAD", "--numstat"])
         .output()?;
-    let modified = String::from_utf8_lossy(&diff.stdout);
-    let modified_count = modified.lines().filter(|l| !l.is_empty()).count();
-
-    // Check for staged files
-    let staged = Command::new("git")
-        .current_dir(worktree_path)
-        .args(["diff", "--cached", "--name-only"])
-        .output()?;
-    let staged_output = String::from_utf8_lossy(&staged.stdout);
-    let staged_count = staged_output.lines().filter(|l| !l.is_empty()).count();
+    let numstat = String::from_utf8_lossy(&diff_numstat.stdout);
+    let (added, deleted) = parse_numstat(&numstat);
+    status.lines_added = added;
+    status.lines_deleted = deleted;
 
     // Check for untracked files (excluding .claude directory)
     let untracked = Command::new("git")
@@ -452,9 +469,9 @@ pub fn get_worktree_status(worktree_path: &Path) -> Result<WorktreeStatus> {
         .filter(|f| !f.is_empty() && !f.starts_with(".claude/"))
         .count();
 
-    status.modified_files = modified_count + staged_count;
     status.untracked_files = untracked_count;
-    status.has_uncommitted = status.modified_files > 0 || status.untracked_files > 0;
+    status.has_uncommitted =
+        status.lines_added > 0 || status.lines_deleted > 0 || status.untracked_files > 0;
 
     // Check commits ahead of remote
     let branch = get_worktree_branch(worktree_path)?;
